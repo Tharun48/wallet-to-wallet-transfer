@@ -5,19 +5,22 @@ import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 @Component
 public class IdempotencyFilter implements GlobalFilter, Ordered {
 
     private final ReactiveStringRedisTemplate redisTemplate;
-    private static final String IDEMPOTENCY_HEADER = "idempotency-key";
+    private static final String IDEMPOTENCY_HEADER = "idempotencyKey";
+    private static final String PROCESSING = "PROCESSING";
 
     IdempotencyFilter(ReactiveStringRedisTemplate redisTemplate){
         this.redisTemplate=redisTemplate;
@@ -44,22 +47,42 @@ public class IdempotencyFilter implements GlobalFilter, Ordered {
             // Construct a distinct tracking key for Redis isolation
             String redisKey = "idempotency:" + path + ":" + idempotencyKey;
 
-            //Execute the non-blocking Redis check (SETNX equivalent) with a 10-minute window
-            return redisTemplate.opsForValue()
-                    .setIfAbsent(redisKey, "PROCESSING", Duration.ofMinutes(10))
-                    .flatMap(isAbsent -> {
-                        if (Boolean.TRUE.equals(isAbsent)) {
-                            // Key did NOT exist -> First time seeing this request. Route to Wallet application.
-                            return chain.filter(exchange);
+            return redisTemplate.opsForValue().get(redisKey)
+                    .flatMap(cachedValue -> {
+                        if (PROCESSING.equals(cachedValue)) {
+                            // 1. Still in progress -> Block duplicate execution with HTTP 409
+                            return setErrorResponse(exchange, HttpStatus.CONFLICT, "Duplicate request in progress.");
                         } else {
-                            // Key ALREADY exists -> Duplicate request caught. Reject immediately at the edge.
-                            return setErrorResponse(exchange, HttpStatus.CONFLICT, "Duplicate request detected. Action is already processing or completed.");
+                            // 2. Response ALREADY exists in Redis -> Return the saved JSON directly with HTTP 200!
+                            return setSuccessResponse(exchange, cachedValue);
                         }
-                    });
+                    })
+                    .switchIfEmpty(
+                            // 3. Completely new request -> Lock with "PROCESSING" and forward downstream
+                            redisTemplate.opsForValue()
+                                    .setIfAbsent(redisKey, PROCESSING, Duration.ofMinutes(10))
+                                    .flatMap(isAcquired -> {
+                                        if (Boolean.TRUE.equals(isAcquired)) {
+                                            return chain.filter(exchange); // Forward to Wallet Service
+                                        } else {
+                                            return setErrorResponse(exchange, HttpStatus.CONFLICT, "Duplicate request detected.");
+                                        }
+                                    })
+                    );
         }
 
         // Pass-through for safe operations (GET balance, etc.) or unrelated routes
         return chain.filter(exchange);
+    }
+
+    private Mono<Void> setSuccessResponse(ServerWebExchange exchange, String jsonBody) {
+        ServerHttpResponse response = exchange.getResponse();
+
+        response.setStatusCode(HttpStatus.OK);
+        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+
+        byte[] bytes = jsonBody.getBytes(StandardCharsets.UTF_8);
+        return response.writeWith(Mono.just(response.bufferFactory().wrap(bytes)));
     }
 
     private Mono<Void> setErrorResponse(ServerWebExchange exchange, HttpStatus status, String message) {

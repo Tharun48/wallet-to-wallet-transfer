@@ -1,5 +1,6 @@
 package com.wallet.wallet.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wallet.wallet.dto.TransferEnquiryList;
 import com.wallet.wallet.dto.TransferRequestDTO;
 import com.wallet.wallet.dto.TransferResponeDTO;
@@ -18,9 +19,13 @@ import com.wallet.wallet.repo.WalletRepo;
 import jakarta.persistence.EntityNotFoundException;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.bind.annotation.RequestParam;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.Month;
@@ -32,10 +37,14 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class TransferService {
 
+    private static final Logger log = LoggerFactory.getLogger(TransferService.class);
+
     public final TransferRepo transferRepo;
     public final WalletRepo walletRepo;
     public final TransactionMapper transactionMapper;
     public final LedgerRepo ledgerRepo;
+    private final StringRedisTemplate redisTemplate;
+    private final ObjectMapper objectMapper;
 
     /*
      * have to deal with the idempotency
@@ -49,11 +58,12 @@ public class TransferService {
      * return the response
      */
     @Transactional
-    public TransferResponeDTO createTransfer(TransferRequestDTO transferRequestDTO) throws InsufficientFunds {
+    public TransferResponeDTO createTransfer(TransferRequestDTO transferRequestDTO, String idempotencyKey) throws InsufficientFunds {
         Transaction transaction = transactionMapper.toEntity(transferRequestDTO);
         transaction.setPaymentStatus(PAYMENT_STATUS.PROCESSING);
         transaction.setTransactionDate(LocalDateTime.now());
         Transaction savedTransaction = transferRepo.save(transaction);
+        String requestPath = "/transfer";
 
         int firstWallet     = Math.min(transferRequestDTO.toWalletId(),transferRequestDTO.fromWalletId());
         int secondWallet    = Math.max(transferRequestDTO.toWalletId(),transferRequestDTO.fromWalletId());
@@ -104,7 +114,20 @@ public class TransferService {
         ledgerRepo.save(fromLedgerEntry);
         ledgerRepo.save(toLedgerEntry);
 
-        return transactionMapper.toDto(savedTransaction);
+        TransferResponeDTO transferResponeDTO =  transactionMapper.toDto(savedTransaction);
+
+        // 2. Persist cached JSON response to Redis after DB logic succeeds
+        try {
+            String redisKey = "idempotency:" + requestPath + ":" + idempotencyKey;
+            String jsonResponse = objectMapper.writeValueAsString(transferResponeDTO);
+
+            // Overwrite "PROCESSING" string with actual JSON response and set a 24-hour TTL
+            redisTemplate.opsForValue().set(redisKey, jsonResponse, Duration.ofHours(24));
+        } catch (Exception e) {
+            // Log exception without failing the database transaction
+            log.error("Failed to update idempotency cache in Redis", e);
+        }
+        return  transferResponeDTO;
     }
 
     public List<TransferEnquiryList> getEnquiryHistory(int walletId, MONTH month, PAYMENT_STATUS paymentStatus, CATEGORY category){

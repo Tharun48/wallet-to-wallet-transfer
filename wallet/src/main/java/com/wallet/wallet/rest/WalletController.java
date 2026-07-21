@@ -17,8 +17,8 @@ public class WalletController {
 
     //api to create the wallet
     @PostMapping("/wallet")
-    public ResponseEntity<WalletResponseDTO> saveWallet(@RequestBody WalletRequestDTO walletRequestDTO){
-        WalletResponseDTO walletResponseDTO = walletService.createWallet(walletRequestDTO);
+    public ResponseEntity<WalletResponseDTO> saveWallet(@RequestBody WalletRequestDTO walletRequestDTO, @RequestHeader String idempotencyKey){
+        WalletResponseDTO walletResponseDTO = walletService.createWallet(walletRequestDTO,idempotencyKey);
         return new ResponseEntity<>(walletResponseDTO, HttpStatus.CREATED);
     }
 

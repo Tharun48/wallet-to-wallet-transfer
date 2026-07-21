@@ -24,8 +24,8 @@ public class TransferController {
     public final TransferService transferService;
 
     @PostMapping("/transfer")
-    public ResponseEntity<TransferResponeDTO> saveTransfer(@RequestBody TransferRequestDTO transferRequestDTO) throws InsufficientFunds {
-        TransferResponeDTO transferResponeDTO = transferService.createTransfer(transferRequestDTO);
+    public ResponseEntity<TransferResponeDTO> saveTransfer(@RequestBody TransferRequestDTO transferRequestDTO,@RequestHeader String idempotencyKey) throws InsufficientFunds {
+        TransferResponeDTO transferResponeDTO = transferService.createTransfer(transferRequestDTO,idempotencyKey);
         return new ResponseEntity<>(transferResponeDTO, HttpStatus.OK);
     }
 
